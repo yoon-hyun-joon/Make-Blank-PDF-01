@@ -1,7 +1,9 @@
 import os
 import re
 import io
+import html
 import tempfile
+import urllib.request
 import streamlit as st
 import pypdf
 from reportlab.lib.pagesizes import A4
@@ -11,37 +13,46 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+import google.generativeai as genai
 
 # ---------------------------------------------------------
-# 1. 한글 폰트 설정 (Noto Sans CJK / System Korean Font)
+# 1. Korean Font Setup (Noto Sans CJK / NanumGothic Fallback)
 # ---------------------------------------------------------
 def setup_korean_font():
     font_paths = [
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansKR-Regular.ttf",
-        "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
-        "C:/Windows/Fonts/malgun.ttf",  # Windows
-        "/System/Library/Fonts/AppleSDGothicNeo.ttc",  # macOS
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        "/usr/share/fonts/truetype/noto-cjk/NotoSansKR-Regular.ttf",
+        "C:/Windows/Fonts/malgun.ttf",
+        "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
     ]
     font_name = "Helvetica"
     for fp in font_paths:
         if os.path.exists(fp):
             try:
-                if fp.endswith(".ttc"):
-                    pdfmetrics.registerFont(TTFont("NotoSansCJK", fp, subfontIndex=0))
-                    font_name = "NotoSansCJK"
-                else:
-                    pdfmetrics.registerFont(TTFont("NotoSansKR", fp))
-                    font_name = "NotoSansKR"
+                pdfmetrics.registerFont(TTFont("KoreanFont", fp))
+                font_name = "KoreanFont"
                 break
-            except Exception as e:
+            except Exception:
                 continue
+                
+    if font_name == "Helvetica":
+        try:
+            target_path = os.path.join(tempfile.gettempdir(), "NanumGothic.ttf")
+            if not os.path.exists(target_path):
+                url = "https://github.com/google/fonts/raw/main/ofl/nanumgothic/NanumGothic-Regular.ttf"
+                urllib.request.urlretrieve(url, target_path)
+            if os.path.exists(target_path):
+                pdfmetrics.registerFont(TTFont("KoreanFont", target_path))
+                font_name = "KoreanFont"
+        except Exception:
+            pass
+            
     return font_name
 
 FONT_NAME = setup_korean_font()
 
 # ---------------------------------------------------------
-# 2. Page Numbering Canvas
+# 2. Numbered Canvas for Page Header/Footer
 # ---------------------------------------------------------
 class NumberedCanvas(canvas.Canvas):
     def __init__(self, *args, **kwargs):
@@ -78,64 +89,77 @@ class NumberedCanvas(canvas.Canvas):
         self.restoreState()
 
 # ---------------------------------------------------------
-# 3. PDF 처리 및 빈칸 생성 코어 로직
+# 3. PDF Parsing & Core Logic
 # ---------------------------------------------------------
-def extract_text_from_pdf(pdf_file_bytes):
-    reader = pypdf.PdfReader(io.BytesIO(pdf_file_bytes))
+def extract_text_from_pdf(pdf_bytes):
+    reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
     pages_text = []
     for page in reader.pages:
         text = page.extract_text() or ""
-        pages_text.append(text)
+        if text.strip():
+            pages_text.append(text)
     return pages_text
 
-def extract_auto_keywords(text_list, max_keywords=50):
+def strip_josa(word):
+    josa_list = ['은', '는', '이', '가', '의', '에', '로', '으로', '을', '를', '과', '와', '도', '만', '에서', '부터', '까지', '입니다', '하고', '이며']
+    for j in sorted(josa_list, key=len, reverse=True):
+        if word.endswith(j) and len(word) > len(j) + 1:
+            return word[:-len(j)]
+    return word
+
+def extract_auto_keywords_fallback(text_list, max_keywords=30):
     full_text = " ".join(text_list)
-    # 한글 및 영문 2자 이상 단어 추출
     words = re.findall(r'[가-힣a-zA-Z0-9]{2,}', full_text)
-    
-    stop_words = {
-        '그리고', '하지만', '또한', '따라서', '이에', '때문에', '통해', '위해',
-        '경우', '대한', '통한', '관한', '의해', '속에', '아래', '위의', '모든',
-        '있다', '없다', '한다', '된다', '이다', '것이다', '수', '등', '및'
-    }
+    stop_words = {'그리고', '하지만', '또한', '따라서', '이에', '때문에', '통해', '위해', '경우', '대한', '통한', '관한', '의해', '속에', '아래', '위의', '모든', '있다', '없다', '한다', '된다', '이다', '것이다', '수', '등', '및'}
     
     freq = {}
     for w in words:
-        if w not in stop_words and len(w) >= 2:
-            freq[w] = freq.get(w, 0) + 1
+        clean_w = strip_josa(w)
+        if clean_w not in stop_words and len(clean_w) >= 2:
+            freq[clean_w] = freq.get(clean_w, 0) + 1
             
     sorted_words = sorted(freq.items(), key=lambda x: x[1], reverse=True)
     return [w[0] for w in sorted_words[:max_keywords]]
 
-def generate_blank_pdf(pages_text, target_keywords, blank_ratio=0.2):
-    answer_key = []
-    blank_counter = 1
-    processed_pages = []
+def get_working_gemini_model(api_key):
+    clean_key = api_key.strip().strip("'").strip('"')
+    genai.configure(api_key=clean_key)
+    try:
+        available_models = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                available_models.append(m.name)
+        for m_name in available_models:
+            if 'flash' in m_name or 'pro' in m_name:
+                try:
+                    model = genai.GenerativeModel(m_name)
+                    return model
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return genai.GenerativeModel('gemini-1.5-flash')
+
+def extract_keywords_with_gemini(api_key, text_list, num_keywords=30):
+    model = get_working_gemini_model(api_key)
+    full_text = "\n".join(text_list)[:10000]
+    prompt = f"""
+    다음 교육/학습 문서에서 가장 핵심이 되는 주요 용어, 개념, 학자 이름, 전문 키워드를 {num_keywords}개 선정해 주세요.
     
-    # 단어 길이 긴 순서로 정렬 (중복 치환 방지)
-    sorted_keywords = sorted(list(set(target_keywords)), key=lambda x: len(x), reverse=True)
+    조건:
+    1. 한국어 조사(은/는/이/가/의/에/로/을/를/과/와/도/만/에서/부터/까지 등)를 완전히 제거한 순수한 개념어/명사 형태만 반환하세요.
+    2. 쉼표(,)로만 구분하여 단어 목록만 출력하세요.
+    3. 부연 설명, 번호, 개간, 안내 문구는 절대로 포함하지 마세요.
     
-    for page_num, text in enumerate(pages_text, 1):
-        page_lines = text.split('\n')
-        new_lines = []
-        for line in page_lines:
-            tokens = line.split()
-            new_tokens = []
-            for token in tokens:
-                matched = False
-                for kw in sorted_keywords:
-                    if kw in token and len(kw) >= 2:
-                        blank_str = f"<b>[ {blank_counter}. ____________ ]</b>"
-                        token = token.replace(kw, blank_str, 1)
-                        answer_key.append((blank_counter, kw))
-                        blank_counter += 1
-                        matched = True
-                        break
-                new_tokens.append(token)
-            new_lines.append(" ".join(new_tokens))
-        processed_pages.append("\n".join(new_lines))
-        
-    # PDF 생성
+    [문서 내용]:
+    {full_text}
+    """
+    response = model.generate_content(prompt)
+    raw_response = response.text.strip()
+    keywords = [k.strip() for k in raw_response.replace("\n", "").split(",") if k.strip()]
+    return keywords
+
+def generate_blank_pdf(pages_text, target_keywords):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer,
@@ -150,52 +174,60 @@ def generate_blank_pdf(pages_text, target_keywords, blank_ratio=0.2):
     title_style = ParagraphStyle(
         'DocTitle',
         fontName=FONT_NAME,
-        fontSize=20,
-        leading=26,
+        fontSize=18,
+        leading=24,
         textColor=colors.HexColor("#1A365D"),
-        spaceAfter=15,
-        alignment=0
-    )
-    
-    heading_style = ParagraphStyle(
-        'SectionHeading',
-        fontName=FONT_NAME,
-        fontSize=14,
-        leading=18,
-        textColor=colors.HexColor("#2B6CB0"),
-        spaceBefore=12,
-        spaceAfter=8,
-        keepWithNext=True
+        spaceAfter=12
     )
     
     body_style = ParagraphStyle(
         'BodyTextKorean',
         fontName=FONT_NAME,
-        fontSize=10.5,
-        leading=16,
+        fontSize=10,
+        leading=15,
         textColor=colors.HexColor("#2D3748"),
-        spaceAfter=8
+        spaceAfter=4
     )
     
     story = []
-    story.append(Spacer(1, 15))
-    story.append(Paragraph("📄 PDF 빈칸 학습지 (Blank Study Guide)", title_style))
-    story.append(Paragraph("원문 문서의 구조를 유지하며 핵심 키워드를 빈칸으로 재구성하였습니다.", body_style))
+    story.append(Paragraph("<b>📄 PDF 빈칸 학습지 (Blank Study Guide)</b>", title_style))
+    story.append(Paragraph("원문의 내용을 100% 그대로 유지하며 핵심 키워드 위치만 빈칸으로 재구성하였습니다.", body_style))
     story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#CBD5E0"), spaceAfter=15))
     
-    for page_idx, page_content in enumerate(processed_pages, 1):
-        story.append(Paragraph(f"<b>[ Page {page_idx} ]</b>", heading_style))
-        paragraphs = page_content.split('\n')
-        for p in paragraphs:
-            if p.strip():
-                clean_p = p.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                clean_p = clean_p.replace('&lt;b&gt;', '<b>').replace('&lt;/b&gt;', '</b>')
-                story.append(Paragraph(clean_p, body_style))
+    sorted_keywords = sorted(list(set(target_keywords)), key=len, reverse=True)
+    blank_counter = 1
+    answer_key = []
+    
+    for page_idx, text in enumerate(pages_text, 1):
+        lines = text.split('\n')
+        for line in lines:
+            if not line.strip():
+                story.append(Spacer(1, 4))
+                continue
+            escaped_line = html.escape(line)
+            placeholders = {}
+            
+            for kw in sorted_keywords:
+                if not kw or len(kw) < 2:
+                    continue
+                escaped_kw = html.escape(kw)
+                if escaped_kw in escaped_line:
+                    ph_key = f"__BLANK_{blank_counter}__"
+                    placeholders[ph_key] = f'<font color="#D32F2F"><b>[ {blank_counter}. ____________ ]</b></font>'
+                    answer_key.append((blank_counter, kw))
+                    escaped_line = escaped_line.replace(escaped_kw, ph_key, 1)
+                    blank_counter += 1
+                    
+            for ph_key, val in placeholders.items():
+                escaped_line = escaped_line.replace(ph_key, val)
+                
+            story.append(Paragraph(escaped_line, body_style))
+            
         story.append(Spacer(1, 10))
         
-    # 정답지 페이지
+    # Answer Key Page
     story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#2B6CB0"), spaceBefore=20, spaceAfter=15))
-    story.append(Paragraph("🗝️ 정답지 (Answer Key)", title_style))
+    story.append(Paragraph("<b>🗝️ 정답지 (Answer Key)</b>", title_style))
     story.append(Paragraph("학습 후 스스로 채점하거나 복습 시 참고하세요.", body_style))
     story.append(Spacer(1, 10))
     
@@ -218,8 +250,8 @@ def generate_blank_pdf(pages_text, target_keywords, blank_ratio=0.2):
             ('ALIGN', (0,0), (0,-1), 'CENTER'),
             ('ALIGN', (2,0), (2,-1), 'CENTER'),
             ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#CBD5E0")),
-            ('BOTTOMPADDING', (0,0), (-1,-1), 5),
-            ('TOPPADDING', (0,0), (-1,-1), 5),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+            ('TOPPADDING', (0,0), (-1,-1), 4),
         ]))
         story.append(ans_table)
         
@@ -228,66 +260,78 @@ def generate_blank_pdf(pages_text, target_keywords, blank_ratio=0.2):
     return buffer, len(answer_key)
 
 # ---------------------------------------------------------
-# 4. Streamlit 웹 인터페이스
+# 4. Streamlit UI App
 # ---------------------------------------------------------
 def main():
-    st.set_page_config(
-        page_title="PDF 빈칸 학습지 생성기",
-        page_icon="✏️",
-        layout="wide"
-    )
-    
+    st.set_page_config(page_title="PDF 빈칸 학습지 생성기", page_icon="✏️", layout="wide")
     st.title("✏️ PDF 빈칸 학습지 자동 생성기")
-    st.markdown("PDF 문서를 업로드하면 핵심 키워드를 자동으로 감지하거나 직접 지정하여 **빈칸 학습지 + 정답지 PDF**를 만들어 드립니다.")
+    st.markdown("PDF 원문의 내용을 **100% 그대로 유지**하면서 핵심 키워드 위치만 빈칸으로 변경해 드립니다.")
     st.divider()
     
+    with st.sidebar:
+        st.header("⚙️ API 설정 (선택사항)")
+        api_key = st.text_input("🔑 Gemini API Key 입력", type="password", help="입력하지 않으셔도 스마트 알고리즘으로 작동합니다.")
+        st.markdown("[👉 무료 Gemini API Key 발급받기](https://aistudio.google.com/app/apikey)")
+        st.divider()
+        
     col1, col2 = st.columns([1, 1])
     
     with col1:
         st.subheader("1. PDF 파일 업로드")
-        uploaded_file = st.file_uploader("학습지로 만들 PDF 파일을 선택하세요", type=["pdf"])
+        uploaded_file = st.file_uploader("학습지로 만들 PDF 파일 선택", type=["pdf"])
         
         st.subheader("2. 키워드 설정")
-        mode = st.radio("키워드 선정 방식", ["자동 추출 모드", "수동 키워드 입력 모드"])
+        num_kw = st.slider("추출할 핵심 키워드 개수", min_value=10, max_value=80, value=30, step=5)
         
-        custom_keywords = []
-        if mode == "수동 키워드 입력 모드":
-            kw_input = st.text_area("빈칸으로 만들 키워드를 쉼표(,)로 구분해서 입력하세요", "법인세, 소득, 납세의무자, 익금, 손금")
-            custom_keywords = [k.strip() for k in kw_input.split(",") if k.strip()]
-        else:
-            max_kw_num = st.slider("자동 추출할 최대 키워드 수", min_value=10, max_value=100, value=40, step=5)
-            
     with col2:
-        st.subheader("3. 결과 미리보기 및 파일 생성")
+        st.subheader("3. 결과 확인 및 PDF 생성")
         if uploaded_file is not None:
-            pdf_bytes = uploaded_file.read()
+            file_id = f"{uploaded_file.name}_{uploaded_file.size}"
+            if st.session_state.get('last_file_id') != file_id:
+                st.session_state['last_file_id'] = file_id
+                st.session_state.pop('ai_keywords', None)
+                
+            pdf_bytes = uploaded_file.getvalue()
             pages_text = extract_text_from_pdf(pdf_bytes)
             
-            st.success(f"✅ 총 {len(pages_text)}페이지의 텍스트가 성공적으로 추출되었습니다.")
-            
-            if mode == "자동 추출 모드":
-                target_keywords = extract_auto_keywords(pages_text, max_keywords=max_kw_num)
-                st.info(f"🔍 감지된 주요 키워드 ({len(target_keywords)}개): " + ", ".join(target_keywords[:15]) + " ...")
+            if not pages_text:
+                st.error("❌ PDF에서 텍스트를 추출할 수 없습니다. 스캔 이미지 PDF인지 확인하세요.")
             else:
-                target_keywords = custom_keywords
-                st.info(f"🎯 지정된 키워드 ({len(target_keywords)}개): " + ", ".join(target_keywords))
+                st.success(f"✅ 총 {len(pages_text)}페이지의 텍스트가 정상 추출되었습니다.")
                 
-            if st.button("🚀 빈칸 학습지 PDF 생성하기", type="primary"):
-                with st.spinner("PDF 학습지 생성 중..."):
-                    out_buffer, total_blanks = generate_blank_pdf(pages_text, target_keywords)
+                if st.button("🚀 핵심 키워드 자동 추출 실행하기", type="primary"):
+                    with st.spinner("원문 분석 및 핵심 키워드 추출 중..."):
+                        keywords = []
+                        if api_key.strip():
+                            try:
+                                keywords = extract_keywords_with_gemini(api_key, pages_text, num_keywords=num_kw)
+                            except Exception:
+                                pass
+                        if not keywords:
+                            keywords = extract_auto_keywords_fallback(pages_text, max_keywords=num_kw)
+                            
+                        st.session_state['ai_keywords'] = keywords
+                        st.success(f"🎉 {len(keywords)}개의 핵심 키워드가 선별되었습니다!")
+                        
+                if st.session_state.get('ai_keywords'):
+                    selected_kw = st.multiselect(
+                        "선별된 핵심 키워드 (제외하고 싶은 단어는 ❌를 누르세요)",
+                        options=st.session_state['ai_keywords'],
+                        default=st.session_state['ai_keywords']
+                    )
                     
-                st.balloons()
-                st.success(f"🎉 성공적으로 {total_blanks}개의 빈칸이 포함된 학습지가 생성되었습니다!")
-                
-                st.download_button(
-                    label="📥 빈칸 학습지 PDF 다운로드",
-                    data=out_buffer.getvalue(),
-                    file_name=f"blank_study_guide_{uploaded_file.name}",
-                    mime="application/pdf",
-                    type="primary"
-                )
+                    if selected_kw:
+                        out_buffer, total_blanks = generate_blank_pdf(pages_text, selected_kw)
+                        st.success(f"🎉 원문이 100% 유지된 {total_blanks}개 빈칸 학습지가 완성되었습니다!")
+                        st.download_button(
+                            label="📥 완성된 PDF 학습지 다운로드",
+                            data=out_buffer.getvalue(),
+                            file_name=f"blank_study_{uploaded_file.name}",
+                            mime="application/pdf",
+                            type="primary"
+                        )
         else:
-            st.warning("👈 왼쪽 화면에서 PDF 파일을 업로드해 주세요.")
+            st.warning("👈 왼쪽에서 PDF 파일을 업로드해 주세요.")
 
 if __name__ == "__main__":
     main()
