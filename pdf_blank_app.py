@@ -151,8 +151,7 @@ def extract_keywords_with_gemini(api_key, text_list, num_keywords=30):
     model = get_working_gemini_model(api_key)
     if not model:
         return []
-    full_text = "
-".join(text_list)[:10000]
+    full_text = "\n".join(text_list)[:10000]
     prompt = f"""
     다음 교육/학습 문서에서 가장 핵심이 되는 주요 용어, 개념, 학자 이름, 전문 키워드를 {num_keywords}개 선정해 주세요.
     
