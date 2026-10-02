@@ -151,7 +151,8 @@ def extract_keywords_with_gemini(api_key, text_list, num_keywords=30):
     model = get_working_gemini_model(api_key)
     if not model:
         return []
-    full_text = "\n".join(text_list)[:10000]
+    full_text = "
+".join(text_list)[:10000]
     prompt = f"""
     다음 교육/학습 문서에서 가장 핵심이 되는 주요 용어, 개념, 학자 이름, 전문 키워드를 {num_keywords}개 선정해 주세요.
     
@@ -170,8 +171,8 @@ def extract_keywords_with_gemini(api_key, text_list, num_keywords=30):
 
 def generate_blank_pdf(pages_text, target_keywords):
     """
-    개별 항목이나 문단 구분을 전혀 하지 않고,
-    원문 텍스트 전체를 하나의 연속된 줄글(Running Prose) 형태로 연결하여 생성합니다.
+    원문 텍스트 전체를 하나의 연속된 줄글로 재구성하되,
+    HTML 태그가 중간에 쪼개지지 않도록 안전하게 분할 렌더링합니다.
     """
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -202,12 +203,20 @@ def generate_blank_pdf(pages_text, target_keywords):
         spaceAfter=10
     )
     
+    table_cell_style = ParagraphStyle(
+        'TableCellKorean',
+        fontName=FONT_NAME,
+        fontSize=9.5,
+        leading=12,
+        textColor=colors.HexColor("#2D3748")
+    )
+    
     story = []
     story.append(Paragraph("<b>📄 PDF 빈칸 학습지 (Blank Study Guide)</b>", title_style))
     story.append(Paragraph("원문의 전체 내용을 항목 및 문단 구분 없이 하나의 줄글(연속 텍스트)로 연결하여 핵심 키워드를 빈칸으로 재구성하였습니다.", body_style))
     story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#CBD5E0"), spaceAfter=15))
     
-    # 1. 모든 페이지의 단어들을 단일 공백으로 연결하여 하나의 연속된 줄글(Full Prose) 생성
+    # 1. 모든 페이지의 텍스트를 공백 기반의 단어 리스트로 정규화
     all_words = []
     for page_text in pages_text:
         words = page_text.split()
@@ -216,7 +225,7 @@ def generate_blank_pdf(pages_text, target_keywords):
             
     full_prose = " ".join(all_words)
     
-    # 2. HTML 이스케이프 처리 및 키워드 빈칸 치환
+    # 2. HTML 특수문자 이스케이프 선행 처리
     escaped_prose = html.escape(full_prose)
     sorted_keywords = sorted(list(set(target_keywords)), key=len, reverse=True)
     
@@ -235,25 +244,32 @@ def generate_blank_pdf(pages_text, target_keywords):
             escaped_prose = escaped_prose.replace(escaped_kw, ph_key, 1)
             blank_counter += 1
             
-    for ph_key, val in placeholders.items():
-        escaped_prose = escaped_prose.replace(ph_key, val)
-        
-    # 3. 연속 줄글 텍스트를 ~1500자 단위로 나누어 렌더링 (ReportLab 용지 레이아웃에 맞춰 연속 표시)
-    chunk_size = 1500
-    words_in_prose = escaped_prose.split(' ')
+    # 3. 태그 파손 방지 청킹
+    sentences = re.split(r'([.?!]\s+)', escaped_prose)
+    
+    chunks = []
     current_chunk = []
     current_length = 0
+    max_chunk_length = 1200
     
-    for w in words_in_prose:
-        current_chunk.append(w)
-        current_length += len(w) + 1
-        if current_length >= chunk_size:
-            story.append(Paragraph(" ".join(current_chunk), body_style))
+    for part in sentences:
+        if not part:
+            continue
+        current_chunk.append(part)
+        current_length += len(part)
+        if current_length >= max_chunk_length and re.match(r'[.?!]\s+', part):
+            chunks.append("".join(current_chunk))
             current_chunk = []
             current_length = 0
             
     if current_chunk:
-        story.append(Paragraph(" ".join(current_chunk), body_style))
+        chunks.append("".join(current_chunk))
+        
+    for chunk in chunks:
+        for ph_key, val in placeholders.items():
+            if ph_key in chunk:
+                chunk = chunk.replace(ph_key, val)
+        story.append(Paragraph(chunk, body_style))
         
     # 4. 정답지 페이지 (Answer Key)
     story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#2B6CB0"), spaceBefore=20, spaceAfter=15))
@@ -264,12 +280,19 @@ def generate_blank_pdf(pages_text, target_keywords):
     if answer_key:
         table_data = [["번호", "정답 키워드", "번호", "정답 키워드"]]
         for i in range(0, len(answer_key), 2):
-            row1 = [f"{answer_key[i][0]}.", answer_key[i][1]]
+            k1_safe = html.escape(answer_key[i][1])
+            col1_p = Paragraph(f"{answer_key[i][0]}.", table_cell_style)
+            col2_p = Paragraph(k1_safe, table_cell_style)
+            
             if i + 1 < len(answer_key):
-                row2 = [f"{answer_key[i+1][0]}.", answer_key[i+1][1]]
+                k2_safe = html.escape(answer_key[i+1][1])
+                col3_p = Paragraph(f"{answer_key[i+1][0]}.", table_cell_style)
+                col4_p = Paragraph(k2_safe, table_cell_style)
             else:
-                row2 = ["", ""]
-            table_data.append(row1 + row2)
+                col3_p = Paragraph("", table_cell_style)
+                col4_p = Paragraph("", table_cell_style)
+                
+            table_data.append([col1_p, col2_p, col3_p, col4_p])
             
         ans_table = Table(table_data, colWidths=[40, 200, 40, 200])
         ans_table.setStyle(TableStyle([
@@ -280,8 +303,8 @@ def generate_blank_pdf(pages_text, target_keywords):
             ('ALIGN', (0,0), (0,-1), 'CENTER'),
             ('ALIGN', (2,0), (2,-1), 'CENTER'),
             ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#CBD5E0")),
-            ('BOTTOMPADDING', (0,0), (-1,-1), 4),
-            ('TOPPADDING', (0,0), (-1,-1), 4),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+            ('TOPPADDING', (0,0), (-1,-1), 5),
         ]))
         story.append(ans_table)
         
