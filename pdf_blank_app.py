@@ -13,7 +13,12 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-import google.generativeai as genai
+
+try:
+    import google.generativeai as genai
+    HAS_GENAI = True
+except ImportError:
+    HAS_GENAI = False
 
 # ---------------------------------------------------------
 # 1. Korean Font Setup (Noto Sans CJK / NanumGothic Fallback)
@@ -122,18 +127,20 @@ def extract_auto_keywords_fallback(text_list, max_keywords=30):
     return [w[0] for w in sorted_words[:max_keywords]]
 
 def get_working_gemini_model(api_key):
+    if not HAS_GENAI:
+        return None
     clean_key = api_key.strip().strip("'").strip('"')
     genai.configure(api_key=clean_key)
     try:
-        available_models = []
-        for m in genai.list_models():
+        models = genai.list_models()
+        for m in models:
             if 'generateContent' in m.supported_generation_methods:
-                available_models.append(m.name)
-        for m_name in available_models:
-            if 'flash' in m_name or 'pro' in m_name:
+                m_name = m.name.replace('models/', '')
                 try:
                     model = genai.GenerativeModel(m_name)
-                    return model
+                    resp = model.generate_content("test")
+                    if resp and resp.text:
+                        return model
                 except Exception:
                     continue
     except Exception:
@@ -142,6 +149,8 @@ def get_working_gemini_model(api_key):
 
 def extract_keywords_with_gemini(api_key, text_list, num_keywords=30):
     model = get_working_gemini_model(api_key)
+    if not model:
+        return []
     full_text = "\n".join(text_list)[:10000]
     prompt = f"""
     다음 교육/학습 문서에서 가장 핵심이 되는 주요 용어, 개념, 학자 이름, 전문 키워드를 {num_keywords}개 선정해 주세요.
@@ -160,6 +169,10 @@ def extract_keywords_with_gemini(api_key, text_list, num_keywords=30):
     return keywords
 
 def generate_blank_pdf(pages_text, target_keywords):
+    """
+    개별 항목이나 문단 구분을 전혀 하지 않고,
+    원문 텍스트 전체를 하나의 연속된 줄글(Running Prose) 형태로 연결하여 생성합니다.
+    """
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer,
@@ -184,48 +197,65 @@ def generate_blank_pdf(pages_text, target_keywords):
         'BodyTextKorean',
         fontName=FONT_NAME,
         fontSize=10,
-        leading=15,
+        leading=16,
         textColor=colors.HexColor("#2D3748"),
-        spaceAfter=4
+        spaceAfter=10
     )
     
     story = []
     story.append(Paragraph("<b>📄 PDF 빈칸 학습지 (Blank Study Guide)</b>", title_style))
-    story.append(Paragraph("원문의 내용을 100% 그대로 유지하며 핵심 키워드 위치만 빈칸으로 재구성하였습니다.", body_style))
+    story.append(Paragraph("원문의 전체 내용을 항목 및 문단 구분 없이 하나의 줄글(연속 텍스트)로 연결하여 핵심 키워드를 빈칸으로 재구성하였습니다.", body_style))
     story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#CBD5E0"), spaceAfter=15))
     
+    # 1. 모든 페이지의 단어들을 단일 공백으로 연결하여 하나의 연속된 줄글(Full Prose) 생성
+    all_words = []
+    for page_text in pages_text:
+        words = page_text.split()
+        if words:
+            all_words.extend(words)
+            
+    full_prose = " ".join(all_words)
+    
+    # 2. HTML 이스케이프 처리 및 키워드 빈칸 치환
+    escaped_prose = html.escape(full_prose)
     sorted_keywords = sorted(list(set(target_keywords)), key=len, reverse=True)
+    
     blank_counter = 1
     answer_key = []
+    placeholders = {}
     
-    for page_idx, text in enumerate(pages_text, 1):
-        lines = text.split('\n')
-        for line in lines:
-            if not line.strip():
-                story.append(Spacer(1, 4))
-                continue
-            escaped_line = html.escape(line)
-            placeholders = {}
+    for kw in sorted_keywords:
+        if not kw or len(kw) < 2:
+            continue
+        escaped_kw = html.escape(kw)
+        if escaped_kw in escaped_prose:
+            ph_key = f"__BLANK_{blank_counter}__"
+            placeholders[ph_key] = f'<font color="#D32F2F"><b>[ {blank_counter}. ____________ ]</b></font>'
+            answer_key.append((blank_counter, kw))
+            escaped_prose = escaped_prose.replace(escaped_kw, ph_key, 1)
+            blank_counter += 1
             
-            for kw in sorted_keywords:
-                if not kw or len(kw) < 2:
-                    continue
-                escaped_kw = html.escape(kw)
-                if escaped_kw in escaped_line:
-                    ph_key = f"__BLANK_{blank_counter}__"
-                    placeholders[ph_key] = f'<font color="#D32F2F"><b>[ {blank_counter}. ____________ ]</b></font>'
-                    answer_key.append((blank_counter, kw))
-                    escaped_line = escaped_line.replace(escaped_kw, ph_key, 1)
-                    blank_counter += 1
-                    
-            for ph_key, val in placeholders.items():
-                escaped_line = escaped_line.replace(ph_key, val)
-                
-            story.append(Paragraph(escaped_line, body_style))
-            
-        story.append(Spacer(1, 10))
+    for ph_key, val in placeholders.items():
+        escaped_prose = escaped_prose.replace(ph_key, val)
         
-    # Answer Key Page
+    # 3. 연속 줄글 텍스트를 ~1500자 단위로 나누어 렌더링 (ReportLab 용지 레이아웃에 맞춰 연속 표시)
+    chunk_size = 1500
+    words_in_prose = escaped_prose.split(' ')
+    current_chunk = []
+    current_length = 0
+    
+    for w in words_in_prose:
+        current_chunk.append(w)
+        current_length += len(w) + 1
+        if current_length >= chunk_size:
+            story.append(Paragraph(" ".join(current_chunk), body_style))
+            current_chunk = []
+            current_length = 0
+            
+    if current_chunk:
+        story.append(Paragraph(" ".join(current_chunk), body_style))
+        
+    # 4. 정답지 페이지 (Answer Key)
     story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#2B6CB0"), spaceBefore=20, spaceAfter=15))
     story.append(Paragraph("<b>🗝️ 정답지 (Answer Key)</b>", title_style))
     story.append(Paragraph("학습 후 스스로 채점하거나 복습 시 참고하세요.", body_style))
@@ -259,13 +289,10 @@ def generate_blank_pdf(pages_text, target_keywords):
     buffer.seek(0)
     return buffer, len(answer_key)
 
-# ---------------------------------------------------------
-# 4. Streamlit UI App
-# ---------------------------------------------------------
 def main():
     st.set_page_config(page_title="PDF 빈칸 학습지 생성기", page_icon="✏️", layout="wide")
     st.title("✏️ PDF 빈칸 학습지 자동 생성기")
-    st.markdown("PDF 원문의 내용을 **100% 그대로 유지**하면서 핵심 키워드 위치만 빈칸으로 변경해 드립니다.")
+    st.markdown("PDF 원문의 전체 내용을 항목/문단 구분 없이 **하나의 연속된 줄글(연속 텍스트)**로 연결하여 빈칸 학습지를 만들어 드립니다.")
     st.divider()
     
     with st.sidebar:
@@ -322,7 +349,7 @@ def main():
                     
                     if selected_kw:
                         out_buffer, total_blanks = generate_blank_pdf(pages_text, selected_kw)
-                        st.success(f"🎉 원문이 100% 유지된 {total_blanks}개 빈칸 학습지가 완성되었습니다!")
+                        st.success(f"🎉 줄글 형태로 연결된 {total_blanks}개 빈칸 학습지가 완성되었습니다!")
                         st.download_button(
                             label="📥 완성된 PDF 학습지 다운로드",
                             data=out_buffer.getvalue(),

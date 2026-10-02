@@ -1,4 +1,4 @@
+google-generativeai
 streamlit
 pypdf
 reportlab
-google-generativeai
