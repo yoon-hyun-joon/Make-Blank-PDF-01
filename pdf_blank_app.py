@@ -13,15 +13,21 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-import google.generativeai as genai
+
+try:
+    import google.generativeai as genai
+    HAS_GENAI = True
+except ImportError:
+    HAS_GENAI = False
 
 # ---------------------------------------------------------
-# 1. Korean Font Setup (Noto Sans CJK / NanumGothic Fallback)
+# 1. 한글 폰트 설정 (다중 Fallback 설정)
 # ---------------------------------------------------------
 def setup_korean_font():
     font_paths = [
         "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
         "/usr/share/fonts/truetype/noto-cjk/NotoSansKR-Regular.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "C:/Windows/Fonts/malgun.ttf",
         "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
     ]
@@ -52,7 +58,7 @@ def setup_korean_font():
 FONT_NAME = setup_korean_font()
 
 # ---------------------------------------------------------
-# 2. Numbered Canvas for Page Header/Footer
+# 2. Numbered Canvas for Header & Footer
 # ---------------------------------------------------------
 class NumberedCanvas(canvas.Canvas):
     def __init__(self, *args, **kwargs):
@@ -67,17 +73,18 @@ class NumberedCanvas(canvas.Canvas):
         num_pages = len(self._saved_page_states)
         for state in self._saved_page_states:
             self.__dict__.update(state)
-            self.draw_page_number(num_pages)
-            canvas.Canvas.showPage(self)
-        canvas.Canvas.save(self)
+            self.draw_header_footer(num_pages)
+            super().showPage()
+        super().save()
 
-    def draw_page_number(self, page_count):
+    def draw_header_footer(self, page_count):
         self.saveState()
-        self.setFont(FONT_NAME, 9)
+        self.setFont(FONT_NAME, 8)
         self.setFillColor(colors.HexColor("#718096"))
         
-        # Header
+        # Header (Margins 54 to 541)
         self.drawString(54, 800, "교육학 핵심 키워드 빈칸 학습지 (Blank Study Guide)")
+        self.drawRightString(541, 800, "Gemini Notebook")
         self.setStrokeColor(colors.HexColor("#E2E8F0"))
         self.setLineWidth(0.5)
         self.line(54, 792, 541, 792)
@@ -89,9 +96,9 @@ class NumberedCanvas(canvas.Canvas):
         self.restoreState()
 
 # ---------------------------------------------------------
-# 3. PDF Parsing & Core Logic
+# 3. PDF Parsing & Smart Local Keyword Extraction
 # ---------------------------------------------------------
-def extract_text_from_pdf(pdf_bytes):
+def extract_text_from_pdf_bytes(pdf_bytes):
     reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
     pages_text = []
     for page in reader.pages:
@@ -101,55 +108,85 @@ def extract_text_from_pdf(pdf_bytes):
     return pages_text
 
 def strip_josa(word):
-    josa_list = ['은', '는', '이', '가', '의', '에', '로', '으로', '을', '를', '과', '와', '도', '만', '에서', '부터', '까지', '입니다', '하고', '이며', '로서', '로써']
+    josa_list = [
+        '은', '는', '이', '가', '의', '에', '로', '으로', '을', '를', '과', '와', '도', '만',
+        '에서', '부터', '까지', '입니다', '하고', '이며', '으로서', '로서', '에도', '에게',
+        '하며', '하여', '하고', '적인', '적으로', '라는', '등의', '과의', '와의', '에의', '에서'
+    ]
     for j in sorted(josa_list, key=len, reverse=True):
         if word.endswith(j) and len(word) > len(j) + 1:
             return word[:-len(j)]
     return word
 
-def extract_auto_keywords_fallback(text_list, max_keywords=30):
+def extract_auto_keywords_smart(text_list, max_keywords=30):
     full_text = " ".join(text_list)
-    words = re.findall(r'[가-힣a-zA-Z0-9]{2,}', full_text)
-    stop_words = {'그리고', '하지만', '또한', '따라서', '이에', '때문에', '통해', '위해', '경우', '대한', '통한', '관한', '의해', '속에', '아래', '위의', '모든', '있다', '없다', '한다', '된다', '이다', '것이다', '수', '등', '및', '문서', '소스', '페이지', '내용'}
+    
+    # Quoted terms
+    quoted_terms = re.findall(r'[\'\"「『\(]([가-힣a-zA-Z0-9\s]{2,15})[\'\"」』\)]', full_text)
+    words = re.findall(r'\b[가-힣a-zA-Z0-9]{2,12}\b', full_text)
+    
+    stop_words = {
+        '그리고', '하지만', '또한', '따라서', '이에', '때문에', '통해', '위해', '경우', '대한',
+        '통한', '관한', '의해', '속에', '아래', '위의', '모든', '있다', '없다', '한다', '된다',
+        '이다', '것이다', '수', '등', '및', '또는', '하여', '하며', '있는', '없는', '같은',
+        '자료', '원본', '소스', '내용', '구조', '유지하여', '작성되었습니다', '구성하였습니다', '학습지', '페이지'
+    }
     
     freq = {}
+    for qt in quoted_terms:
+        clean_qt = strip_josa(qt.strip())
+        if len(clean_qt) >= 2 and clean_qt not in stop_words:
+            freq[clean_qt] = freq.get(clean_qt, 0) + 3
+            
     for w in words:
-        clean_w = strip_josa(w)
-        if clean_w not in stop_words and len(clean_w) >= 2:
+        clean_w = strip_josa(w.strip())
+        if len(clean_w) >= 2 and clean_w not in stop_words and not clean_w.isdigit():
             freq[clean_w] = freq.get(clean_w, 0) + 1
             
+    key_patterns = [r'론$', r'법$', r'과정$', r'이론$', r'모형$', r'원리$', r'개념$', r'소득$', r'중심$', r'역량$', r'평가$', r'목표$', r'학자$']
+    for k in list(freq.keys()):
+        for pat in key_patterns:
+            if re.search(pat, k):
+                freq[k] += 2
+                break
+                
     sorted_words = sorted(freq.items(), key=lambda x: x[1], reverse=True)
     return [w[0] for w in sorted_words[:max_keywords]]
 
-def get_working_gemini_model(api_key):
+def format_text_into_smart_structure(pages_text):
+    full_text = "\n".join(pages_text)
+    lines = full_text.split('\n')
+    structured_lines = []
+    
+    theme_count = 1
+    for line in lines:
+        l = line.strip()
+        if not l:
+            continue
+        if re.match(r'^(테마|장|절|제\s*\d+|[0-9]+\.\s*[가-힣]+|대단원|소단원)', l):
+            if not l.startswith("테마"):
+                l = f"테마{theme_count:02d}: {l}"
+                theme_count += 1
+            structured_lines.append(l)
+        elif l.startswith("•") or l.startswith("-") or l.startswith("*"):
+            structured_lines.append(l)
+        elif re.match(r'^\d+\.', l):
+            structured_lines.append(f"• {l}")
+        else:
+            structured_lines.append(l)
+            
+    return "\n".join(structured_lines)
+
+# ---------------------------------------------------------
+# 4. Gemini AI Keyword Extraction & Structuring
+# ---------------------------------------------------------
+def extract_keywords_with_gemini(api_key, text_list, num_keywords=30):
+    if not HAS_GENAI:
+        raise ModuleNotFoundError("google-generativeai 패키지가 설치되지 않았습니다.")
+        
     clean_key = api_key.strip().strip("'").strip('"')
     genai.configure(api_key=clean_key)
     
-    # Try dynamic discovery first
-    try:
-        models = genai.list_models()
-        available_names = [m.name.replace("models/", "") for m in models if "generateContent" in getattr(m, "supported_generation_methods", [])]
-        preferred = ['gemini-1.5-flash', 'gemini-2.0-flash', 'gemini-2.5-flash', 'gemini-1.5-pro', 'gemini-3.1-pro-preview']
-        for p in preferred:
-            if p in available_names:
-                return genai.GenerativeModel(p)
-        if available_names:
-            return genai.GenerativeModel(available_names[0])
-    except Exception:
-        pass
-        
-    # Hardcoded fallback list in order of stability
-    candidate_names = ['gemini-1.5-flash', 'gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-2.5-flash', 'gemini-3.1-pro-preview']
-    for m_name in candidate_names:
-        try:
-            model = genai.GenerativeModel(m_name)
-            return model
-        except Exception:
-            continue
-    raise ValueError("사용 가능한 Gemini AI 모델을 찾을 수 없습니다. API 키를 확인해 주세요.")
-
-def extract_keywords_with_gemini(api_key, text_list, num_keywords=30):
-    model = get_working_gemini_model(api_key)
     full_text = "\n".join(text_list)[:10000]
     prompt = f"""
     다음 교육/학습 문서에서 가장 핵심이 되는 주요 용어, 개념, 학자 이름, 전문 키워드를 {num_keywords}개 선정해 주세요.
@@ -157,42 +194,77 @@ def extract_keywords_with_gemini(api_key, text_list, num_keywords=30):
     조건:
     1. 한국어 조사(은/는/이/가/의/에/로/을/를/과/와/도/만/에서/부터/까지 등)를 완전히 제거한 순수한 개념어/명사 형태만 반환하세요.
     2. 쉼표(,)로만 구분하여 단어 목록만 출력하세요.
-    3. 부연 설명, 번호, 개간, 안내 문구는 절대로 포함하지 마세요.
+    3. 부연 설명, 번호, 안내 문구는 절대로 포함하지 마세요.
     
     [문서 내용]:
     {full_text}
     """
-    response = model.generate_content(prompt)
-    raw_response = response.text.strip()
-    if raw_response:
-        keywords = [k.strip() for k in raw_response.replace("\n", "").split(",") if k.strip()]
-        if keywords:
-            return keywords
-    raise ValueError("AI 모델 응답이 비어 있습니다.")
-
-def structure_doc_with_gemini(api_key, text_list):
+    
+    model_names = ['gemini-1.5-flash', 'gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-1.0-pro']
+    
     try:
-        model = get_working_gemini_model(api_key)
-        full_text = "\n".join(text_list)[:12000]
-        prompt = """
-        다음 학습 원문의 내용과 구조를 100% 유지하면서, 테마(단원)별 개조식 서머리 구조로 정돈해 주세요.
-        
-        형식 지침:
-        테마01: [테마 제목]
-        1. [소주제 제목]
-        • [내용 요약 문장]
-        - [세부 항목 문장]
-        
-        [원문 내용]:
-        """ + full_text
-        
-        resp = model.generate_content(prompt)
-        if resp.text.strip():
-            return resp.text.strip()
+        available = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                available.append(m.name.replace('models/', ''))
+        if available:
+            model_names = available + model_names
     except Exception:
         pass
-    return "\n".join(text_list)
+        
+    last_err = None
+    for m_name in model_names:
+        try:
+            model = genai.GenerativeModel(m_name)
+            response = model.generate_content(prompt)
+            raw_response = response.text.strip()
+            if raw_response:
+                keywords = [k.strip() for k in raw_response.replace("\n", "").split(",") if k.strip()]
+                if keywords:
+                    return keywords
+        except Exception as e:
+            last_err = e
+            continue
+            
+    if last_err:
+        raise last_err
+    raise ValueError("AI 모델 응답을 받을 수 없습니다.")
 
+def structure_doc_with_gemini(api_key, text_list):
+    if not HAS_GENAI:
+        return format_text_into_smart_structure(text_list)
+        
+    clean_key = api_key.strip().strip("'").strip('"')
+    genai.configure(api_key=clean_key)
+    
+    full_text = "\n".join(text_list)[:12000]
+    prompt = """
+    다음 학습 원문의 내용과 구조를 100% 유지하면서, 테마(단원)별 개조식 서머리 구조로 정돈해 주세요.
+    
+    형식 지침:
+    테마01: [테마 제목]
+    1. [소주제 제목]
+    • [내용 요약 문장]
+    - [세부 항목 문장]
+    
+    [원문 내용]:
+    """ + full_text
+    
+    model_names = ['gemini-1.5-flash', 'gemini-2.0-flash', 'gemini-1.5-pro']
+    for m_name in model_names:
+        try:
+            model = genai.GenerativeModel(m_name)
+            resp = model.generate_content(prompt)
+            if resp.text.strip():
+                return resp.text.strip()
+        except Exception:
+            continue
+            
+    return format_text_into_smart_structure(text_list)
+
+# ---------------------------------------------------------
+# 5. PDF Render Engine
+# ---------------------------------------------------------
 def render_study_guide_pdf(filename, structured_text, keywords):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -205,34 +277,42 @@ def render_study_guide_pdf(filename, structured_text, keywords):
     )
     
     styles = getSampleStyleSheet()
+    
     title_style = ParagraphStyle(
         'DocTitle',
+        parent=styles['Normal'],
         fontName=FONT_NAME,
         fontSize=18,
         leading=24,
         textColor=colors.HexColor("#1A365D"),
         spaceAfter=4
     )
+    
     subtitle_style = ParagraphStyle(
         'DocSubTitle',
+        parent=styles['Normal'],
         fontName=FONT_NAME,
         fontSize=9,
         leading=13,
         textColor=colors.HexColor("#4A5568"),
         spaceAfter=12
     )
+    
     theme_style = ParagraphStyle(
         'ThemeHeading',
+        parent=styles['Normal'],
         fontName=FONT_NAME,
-        fontSize=13,
-        leading=17,
+        fontSize=12,
+        leading=16,
         textColor=colors.HexColor("#2B6CB0"),
         spaceBefore=14,
         spaceAfter=6,
         keepWithNext=True
     )
+    
     body_style = ParagraphStyle(
         'BodyTextKorean',
+        parent=styles['Normal'],
         fontName=FONT_NAME,
         fontSize=10,
         leading=16,
@@ -240,22 +320,22 @@ def render_study_guide_pdf(filename, structured_text, keywords):
         spaceAfter=6
     )
     
+    sorted_kw = sorted(list(set(keywords)), key=len, reverse=True)
+    lines = structured_text.split('\n')
+    
     answers = []
     blank_counter = 1
     story = []
     
-    sorted_kw = sorted(list(set(keywords)), key=len, reverse=True) if keywords else []
-    lines = structured_text.split('\n')
-    
     story.append(Paragraph("<b>PDF 핵심 키워드 빈칸 학습지</b>", title_style))
-    story.append(Paragraph(f"원문 소스: <b>{html.escape(filename)}</b> | 본문의 구조와 내용을 그대로 유지하며 핵심 키워드를 빈칸으로 구성하였습니다.", subtitle_style))
+    story.append(Paragraph(f"원문 소스: <b>{filename}</b> | 본문의 구조와 내용을 그대로 유지하며 핵심 키워드를 빈칸으로 구성하였습니다.", subtitle_style))
     story.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor("#1A365D"), spaceAfter=12))
     
     for line in lines:
         if not line.strip():
             continue
             
-        escaped_line = html.escape(line)
+        escaped_line = html.escape(line.strip())
         placeholders = {}
         
         for kw in sorted_kw:
@@ -273,7 +353,7 @@ def render_study_guide_pdf(filename, structured_text, keywords):
             escaped_line = escaped_line.replace(ph_key, val)
             
         if line.strip().startswith("테마"):
-            story.append(Paragraph(escaped_line, theme_style))
+            story.append(Paragraph(f"<b>{escaped_line}</b>", theme_style))
         else:
             story.append(Paragraph(escaped_line, body_style))
             
@@ -313,21 +393,21 @@ def render_study_guide_pdf(filename, structured_text, keywords):
     return buffer, len(answers)
 
 # ---------------------------------------------------------
-# 4. Streamlit UI App
+# 6. Streamlit User Interface
 # ---------------------------------------------------------
 def main():
     st.set_page_config(page_title="PDF 빈칸 학습지 자동 생성기", page_icon="✏️", layout="wide")
     
     st.title("✏️ PDF 빈칸 학습지 자동 생성기")
-    st.markdown("PDF 원문의 체계와 개조식 구조를 유지하며 핵심 키워드를 빈칸으로 만들어 주는 **고품질 학습지 + 정답지 PDF 생성기**입니다.")
+    st.markdown("PDF 원문의 체계와 구조를 유지하면서 핵심 키워드를 빈칸으로 만들어 주는 **고품질 학습지 + 정답지 PDF 생성기**입니다.")
     st.divider()
     
     with st.sidebar:
         st.header("⚙️ API 설정 (선택사항)")
-        api_key = st.text_input("🔑 Gemini API Key 입력", type="password", help="aistudio.google.com에서 무료 발급받은 키를 입력하세요.")
+        api_key = st.text_input("🔑 Gemini API Key 입력", type="password", help="API 키를 입력하면 AI가 더 정밀하게 문맥을 분석하여 키워드를 추출합니다. 없어도 스마트 알고리즘으로 바로 작동합니다.")
         st.markdown("[👉 무료 Gemini API Key 발급받기](https://aistudio.google.com/app/apikey)")
         st.divider()
-        st.info("💡 API 키를 입력하시면 AI가 원문 전체를 테마별로 구조화하고 핵심 용어를 정밀하게 선별합니다.")
+        st.info("💡 API 키가 없어도 스마트 한국어 분석 엔진이 자동으로 키워드를 추출합니다.")
         
     col1, col2 = st.columns([1, 1])
     
@@ -344,10 +424,10 @@ def main():
             file_id = f"{uploaded_file.name}_{uploaded_file.size}"
             if st.session_state.get('last_file_id') != file_id:
                 st.session_state['last_file_id'] = file_id
-                st.session_state.pop('ai_keywords', None)
+                st.session_state.pop('extracted_kws', None)
                 
             pdf_bytes = uploaded_file.getvalue()
-            pages_text = extract_text_from_pdf(pdf_bytes)
+            pages_text = extract_text_from_pdf_bytes(pdf_bytes)
             
             if not pages_text:
                 st.error("❌ PDF에서 텍스트를 추출할 수 없습니다. 스캔본(이미지) PDF인지 확인해 주세요.")
@@ -358,32 +438,37 @@ def main():
                     with st.spinner("문서 분석 및 핵심 키워드 추출 중..."):
                         if api_key.strip():
                             try:
-                                keywords = extract_keywords_with_gemini(api_key, pages_text, num_keywords=num_kw)
-                                st.session_state['ai_keywords'] = keywords
-                                st.success(f"🎉 Gemini AI가 {len(keywords)}개의 핵심 키워드를 추출했습니다!")
+                                kws = extract_keywords_with_gemini(api_key, pages_text, num_keywords=num_kw)
+                                st.session_state['extracted_kws'] = kws
+                                st.success(f"🎉 Gemini AI가 {len(kws)}개의 핵심 키워드를 선별했습니다!")
                             except Exception as e:
-                                st.warning(f"⚠️ API 호출 경고 ({str(e)}). 스마트 알고리즘으로 자동 대체합니다.")
-                                keywords = extract_auto_keywords_fallback(pages_text, max_keywords=num_kw)
-                                st.session_state['ai_keywords'] = keywords
+                                st.warning(f"⚠️ API 호출 경고 ({str(e)}). 스마트 알고리즘으로 즉시 전환합니다.")
+                                kws = extract_auto_keywords_smart(pages_text, max_keywords=num_kw)
+                                st.session_state['extracted_kws'] = kws
+                                st.success(f"⚡ 스마트 알고리즘으로 {len(kws)}개 키워드를 추출했습니다!")
                         else:
-                            keywords = extract_auto_keywords_fallback(pages_text, max_keywords=num_kw)
-                            st.session_state['ai_keywords'] = keywords
-                            st.success(f"⚡ 스마트 알고리즘으로 {len(keywords)}개 키워드를 추출했습니다!")
+                            kws = extract_auto_keywords_smart(pages_text, max_keywords=num_kw)
+                            st.session_state['extracted_kws'] = kws
+                            st.success(f"⚡ 스마트 알고리즘으로 {len(kws)}개 키워드를 추출했습니다!")
                             
-                if st.session_state.get('ai_keywords'):
-                    selected_kw = st.multiselect(
+                current_kws = st.session_state.get('extracted_kws')
+                if current_kws:
+                    selected_kws = st.multiselect(
                         "선별된 핵심 키워드 (원하지 않는 키워드는 ❌로 제외하세요)",
-                        options=st.session_state['ai_keywords'],
-                        default=st.session_state['ai_keywords']
+                        options=current_kws,
+                        default=current_kws
                     )
                     
-                    if selected_kw:
-                        if api_key.strip():
-                            structured_text = structure_doc_with_gemini(api_key, pages_text)
-                        else:
-                            structured_text = "\n".join(pages_text)
+                    if selected_kws:
+                        with st.spinner("PDF 학습지 렌더링 중..."):
+                            if api_key.strip():
+                                structured_text = structure_doc_with_gemini(api_key, pages_text)
+                            else:
+                                structured_text = format_text_into_smart_structure(pages_text)
+                                
+                            out_buffer, total_blanks = render_study_guide_pdf(uploaded_file.name, structured_text, selected_kws)
                             
-                        out_buffer, total_blanks = render_study_guide_pdf(uploaded_file.name, structured_text, selected_kw)
+                        st.balloons()
                         st.success(f"🎉 총 {total_blanks}개의 빈칸이 생성되었습니다!")
                         st.download_button(
                             label="📥 완성된 PDF 학습지 다운로드",
