@@ -112,7 +112,7 @@ def strip_josa(word):
             return word[:-len(j)]
     return word
 
-def extract_auto_keywords_fallback(text_list, max_keywords=30):
+def extract_auto_keywords_fallback(text_list, max_keywords=50):
     full_text = " ".join(text_list)
     words = re.findall(r'[가-힣a-zA-Z0-9]{2,}', full_text)
     stop_words = {'그리고', '하지만', '또한', '따라서', '이에', '때문에', '통해', '위해', '경우', '대한', '통한', '관한', '의해', '속에', '아래', '위의', '모든', '있다', '없다', '한다', '된다', '이다', '것이다', '수', '등', '및'}
@@ -147,11 +147,11 @@ def get_working_gemini_model(api_key):
         pass
     return genai.GenerativeModel('gemini-1.5-flash')
 
-def extract_keywords_with_gemini(api_key, text_list, num_keywords=30):
+def extract_keywords_with_gemini(api_key, text_list, num_keywords=50):
     model = get_working_gemini_model(api_key)
     if not model:
         return []
-    full_text = "\n".join(text_list)[:10000]
+    full_text = "\n".join(text_list)[:20000]
     prompt = f"""
     다음 교육/학습 문서에서 가장 핵심이 되는 주요 용어, 개념, 학자 이름, 전문 키워드를 {num_keywords}개 선정해 주세요.
     
@@ -329,11 +329,8 @@ def main():
         st.subheader("1. PDF 파일 업로드")
         uploaded_file = st.file_uploader("학습지로 만들 PDF 파일 선택", type=["pdf"])
         
-        st.subheader("2. 키워드 설정")
-        num_kw = st.slider("추출할 핵심 키워드 개수", min_value=10, max_value=80, value=30, step=5)
-        
     with col2:
-        st.subheader("3. 결과 확인 및 PDF 생성")
+        st.subheader("2. 키워드 설정 및 PDF 생성")
         if uploaded_file is not None:
             file_id = f"{uploaded_file.name}_{uploaded_file.size}"
             if st.session_state.get('last_file_id') != file_id:
@@ -346,7 +343,20 @@ def main():
             if not pages_text:
                 st.error("❌ PDF에서 텍스트를 추출할 수 없습니다. 스캔 이미지 PDF인지 확인하세요.")
             else:
-                st.success(f"✅ 총 {len(pages_text)}페이지의 텍스트가 정상 추출되었습니다.")
+                num_pages = len(pages_text)
+                max_allowed_keywords = num_pages * 50
+                default_kw = min(max_allowed_keywords, max(10, num_pages * 20))
+                
+                st.success(f"✅ 총 {num_pages}페이지의 텍스트가 정상 추출되었습니다. (페이지당 최대 50개 / 전체 최대 {max_allowed_keywords}개 가능)")
+                
+                num_kw = st.slider(
+                    "추출할 핵심 키워드 개수",
+                    min_value=5,
+                    max_value=max_allowed_keywords,
+                    value=default_kw,
+                    step=5 if max_allowed_keywords >= 50 else 1,
+                    help=f"문서의 총 페이지 수({num_pages}페이지)에 맞춰 최대 {max_allowed_keywords}개(페이지당 50개)까지 설정할 수 있습니다."
+                )
                 
                 if st.button("🚀 핵심 키워드 자동 추출 실행하기", type="primary"):
                     with st.spinner("원문 분석 및 핵심 키워드 추출 중..."):
